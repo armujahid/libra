@@ -4,14 +4,14 @@ use crate::{
 };
 use config::config::VMPublishingOption;
 use std::marker::PhantomData;
-use types::transaction::SignedTransaction;
+use types::transaction::SignatureCheckedTransaction;
+use vm::errors::VMResult;
 use vm_cache_map::Arena;
 
 pub mod execute;
 pub mod validate;
 pub mod verify;
 
-use types::vm_error::VMStatus;
 use validate::{ValidatedTransaction, ValidationMode};
 
 /// The starting point for processing a transaction. All the different states involved are described
@@ -21,9 +21,9 @@ where
     'alloc: 'txn,
     P: ModuleCache<'alloc>,
 {
-    txn: SignedTransaction,
+    txn: SignatureCheckedTransaction,
     module_cache: P,
-    data_cache: &'txn RemoteCache,
+    data_cache: &'txn dyn RemoteCache,
     allocator: &'txn Arena<LoadedModule>,
     phantom: PhantomData<&'alloc ()>,
 }
@@ -35,9 +35,9 @@ where
 {
     /// Creates a new instance of `ProcessTransaction`.
     pub fn new(
-        txn: SignedTransaction,
+        txn: SignatureCheckedTransaction,
         module_cache: P,
-        data_cache: &'txn RemoteCache,
+        data_cache: &'txn dyn RemoteCache,
         allocator: &'txn Arena<LoadedModule>,
     ) -> Self {
         Self {
@@ -55,7 +55,7 @@ where
         self,
         mode: ValidationMode,
         publishing_option: &VMPublishingOption,
-    ) -> Result<ValidatedTransaction<'alloc, 'txn, P>, VMStatus> {
+    ) -> VMResult<ValidatedTransaction<'alloc, 'txn, P>> {
         ValidatedTransaction::new(self, mode, publishing_option)
     }
 }

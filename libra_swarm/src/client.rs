@@ -154,7 +154,7 @@ impl InProcessTestClient {
         mnemonic_file_path: &str,
         validator_set_file: String,
     ) -> Self {
-        let (_, alias_to_cmd) = commands::get_commands();
+        let (_, alias_to_cmd) = commands::get_commands(true);
         Self {
             client: ClientProxy::new(
                 "localhost",
@@ -165,6 +165,7 @@ impl InProcessTestClient {
                     .expect("Unable to get canonical path of faucet key file")
                     .to_str()
                     .unwrap(),
+                false,
                 /* faucet server */ None,
                 Some(mnemonic_file_path.to_string()),
             )

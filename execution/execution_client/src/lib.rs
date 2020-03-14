@@ -9,7 +9,7 @@ use failure::{bail, Result};
 use grpcio::{ChannelBuilder, Environment};
 use proto_conv::{FromProto, IntoProto};
 use std::sync::Arc;
-use types::ledger_info::LedgerInfoWithSignatures;
+use types::crypto_proxies::LedgerInfoWithSignatures;
 
 pub struct ExecutionClient {
     client: execution_grpc::ExecutionClient,

@@ -3,21 +3,18 @@
 //! Loaded representation for function definitions and handles.
 
 use crate::loaded_data::loaded_module::LoadedModule;
+use bytecode_verifier::VerifiedModule;
+use types::identifier::IdentStr;
 use vm::{
-    access::{BaseAccess, ModuleAccess},
-    errors::*,
-    file_format::{Bytecode, CodeUnit, FunctionDefinitionIndex},
+    access::ModuleAccess,
+    file_format::{Bytecode, CodeUnit, FunctionDefinitionIndex, FunctionHandle, FunctionSignature},
     internals::ModuleIndex,
-    CompiledModule,
 };
 
 /// Trait that defines the internal representation of a move function.
 pub trait FunctionReference<'txn>: Sized + Clone {
     /// Create a new function reference to a module
-    fn new(
-        module: &'txn LoadedModule,
-        idx: FunctionDefinitionIndex,
-    ) -> Result<Self, VMInvariantViolation>;
+    fn new(module: &'txn LoadedModule, idx: FunctionDefinitionIndex) -> Self;
 
     /// Fetch the reference to the module where the function is defined.
     fn module(&self) -> &'txn LoadedModule;
@@ -38,7 +35,10 @@ pub trait FunctionReference<'txn>: Sized + Clone {
     fn is_native(&self) -> bool;
 
     /// Return the name of the function
-    fn name(&self) -> &'txn str;
+    fn name(&self) -> &'txn IdentStr;
+
+    /// Returns the signature of the function.
+    fn signature(&self) -> &'txn FunctionSignature;
 }
 
 /// Resolved form of a function handle
@@ -46,25 +46,19 @@ pub trait FunctionReference<'txn>: Sized + Clone {
 pub struct FunctionRef<'txn> {
     module: &'txn LoadedModule,
     def: &'txn FunctionDef,
-    name: &'txn str,
+    handle: &'txn FunctionHandle,
 }
 
 impl<'txn> FunctionReference<'txn> for FunctionRef<'txn> {
-    fn new(
-        module: &'txn LoadedModule,
-        idx: FunctionDefinitionIndex,
-    ) -> Result<Self, VMInvariantViolation> {
+    fn new(module: &'txn LoadedModule, idx: FunctionDefinitionIndex) -> Self {
         let def = &module.function_defs[idx.into_index()];
-        let fn_definition = &module.module.function_def_at(idx);
-        let name_idx = module
-            .module
-            .function_handle_at(fn_definition.function)
-            .name;
-        Ok(FunctionRef {
+        let fn_definition = module.function_def_at(idx);
+        let handle = module.function_handle_at(fn_definition.function);
+        FunctionRef {
             module,
             def,
-            name: module.string_at(name_idx),
-        })
+            handle,
+        }
     }
 
     fn module(&self) -> &'txn LoadedModule {
@@ -91,8 +85,12 @@ impl<'txn> FunctionReference<'txn> for FunctionRef<'txn> {
         (self.def.flags & CodeUnit::NATIVE) == CodeUnit::NATIVE
     }
 
-    fn name(&self) -> &'txn str {
-        self.name
+    fn name(&self) -> &'txn IdentStr {
+        self.module.identifier_at(self.handle.name)
+    }
+
+    fn signature(&self) -> &'txn FunctionSignature {
+        self.module.function_signature_at(self.handle.signature)
     }
 }
 
@@ -107,7 +105,7 @@ pub struct FunctionDef {
 }
 
 impl FunctionDef {
-    pub fn new(module: &CompiledModule, idx: FunctionDefinitionIndex) -> Self {
+    pub fn new(module: &VerifiedModule, idx: FunctionDefinitionIndex) -> Self {
         let definition = module.function_def_at(idx);
         let code = definition.code.code.clone();
         let handle = module.function_handle_at(definition.function);

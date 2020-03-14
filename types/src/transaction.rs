@@ -1,8 +1,6 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-#![allow(clippy::unit_arg)]
-
 use crate::{
     account_address::AccountAddress,
     account_state_blob::AccountStateBlob,
@@ -13,30 +11,44 @@ use crate::{
         AccumulatorProof, SignedTransactionProof,
     },
     proto::events::{EventsForVersions, EventsList},
-    vm_error::VMStatus,
+    vm_error::{StatusCode, StatusType, VMStatus},
     write_set::WriteSet,
 };
 use canonical_serialization::{
     CanonicalDeserialize, CanonicalDeserializer, CanonicalSerialize, CanonicalSerializer,
-    SimpleSerializer,
+    SimpleDeserializer, SimpleSerializer,
 };
 use crypto::{
+    ed25519::*,
     hash::{
         CryptoHash, CryptoHasher, EventAccumulatorHasher, RawTransactionHasher,
         SignedTransactionHasher, TransactionInfoHasher,
     },
-    signing, HashValue, PrivateKey, PublicKey, Signature,
+    traits::*,
+    HashValue,
 };
 use failure::prelude::*;
+#[cfg(any(test, feature = "testing"))]
 use proptest_derive::Arbitrary;
-use proto_conv::{FromProto, IntoProto, IntoProtoBytes};
+use proto_conv::{FromProto, IntoProto};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, convert::TryFrom, fmt, time::Duration};
 
+mod module;
 mod program;
+mod script;
+mod transaction_argument;
 
-pub use program::{Program, TransactionArgument, SCRIPT_HASH_LENGTH};
+#[cfg(test)]
+mod unit_tests;
+
+pub use module::Module;
+pub use program::Program;
 use protobuf::well_known_types::UInt64Value;
+pub use script::{Script, SCRIPT_HASH_LENGTH};
+
+use std::ops::Deref;
+pub use transaction_argument::{parse_as_transaction_argument, TransactionArgument};
 
 pub type Version = u64; // Height - also used for MVCC in StateDB
 
@@ -66,14 +78,14 @@ pub struct RawTransaction {
 }
 
 impl RawTransaction {
-    /// Create a new `RawTransaction` with a program.
+    /// Create a new `RawTransaction` with a payload.
     ///
-    /// Almost all transactions are program transactions. See `new_write_set` for write-set
-    /// transactions.
+    /// It can be either to publish a module, to execute a script, or to issue a writeset
+    /// transaction.
     pub fn new(
         sender: AccountAddress,
         sequence_number: u64,
-        program: Program,
+        payload: TransactionPayload,
         max_gas_amount: u64,
         gas_unit_price: u64,
         expiration_time: Duration,
@@ -81,7 +93,50 @@ impl RawTransaction {
         RawTransaction {
             sender,
             sequence_number,
-            payload: TransactionPayload::Program(program),
+            payload,
+            max_gas_amount,
+            gas_unit_price,
+            expiration_time,
+        }
+    }
+
+    /// Create a new `RawTransaction` with a script.
+    ///
+    /// A script transaction contains only code to execute. No publishing is allowed in scripts.
+    pub fn new_script(
+        sender: AccountAddress,
+        sequence_number: u64,
+        script: Script,
+        max_gas_amount: u64,
+        gas_unit_price: u64,
+        expiration_time: Duration,
+    ) -> Self {
+        RawTransaction {
+            sender,
+            sequence_number,
+            payload: TransactionPayload::Script(script),
+            max_gas_amount,
+            gas_unit_price,
+            expiration_time,
+        }
+    }
+
+    /// Create a new `RawTransaction` with a module to publish.
+    ///
+    /// A module transaction is the only way to publish code. Only one module per transaction
+    /// can be published.
+    pub fn new_module(
+        sender: AccountAddress,
+        sequence_number: u64,
+        module: Module,
+        max_gas_amount: u64,
+        gas_unit_price: u64,
+        expiration_time: Duration,
+    ) -> Self {
+        RawTransaction {
+            sender,
+            sequence_number,
+            payload: TransactionPayload::Module(module),
             max_gas_amount,
             gas_unit_price,
             expiration_time,
@@ -106,21 +161,18 @@ impl RawTransaction {
     }
 
     /// Signs the given `RawTransaction`. Note that this consumes the `RawTransaction` and turns it
-    /// into a `SignedTransaction`.
+    /// into a `SignatureCheckedTransaction`.
+    ///
+    /// For a transaction that has just been signed, its signature is expected to be valid.
     pub fn sign(
         self,
-        private_key: &PrivateKey,
-        public_key: PublicKey,
-    ) -> Result<SignedTransaction> {
-        let raw_txn_bytes = self.clone().into_proto_bytes()?;
-        let hash = RawTransactionBytes(&raw_txn_bytes).hash();
-        let signature = signing::sign_message(hash, private_key)?;
-        Ok(SignedTransaction {
-            raw_txn: self,
-            public_key,
-            signature,
-            raw_txn_bytes,
-        })
+        private_key: &Ed25519PrivateKey,
+        public_key: Ed25519PublicKey,
+    ) -> Result<SignatureCheckedTransaction> {
+        let signature = private_key.sign_message(&self.hash());
+        Ok(SignatureCheckedTransaction(SignedTransaction::new(
+            self, public_key, signature,
+        )))
     }
 
     pub fn into_payload(self) -> TransactionPayload {
@@ -134,6 +186,10 @@ impl RawTransaction {
                 (get_transaction_name(program.code()), program.args())
             }
             TransactionPayload::WriteSet(_) => ("genesis".to_string(), &empty_vec[..]),
+            TransactionPayload::Script(script) => {
+                (get_transaction_name(script.code()), script.args())
+            }
+            TransactionPayload::Module(_) => ("module publishing".to_string(), &empty_vec[..]),
         };
         let mut f_args: String = "".to_string();
         for arg in args {
@@ -161,58 +217,55 @@ impl RawTransaction {
             self.expiration_time,
         )
     }
+    /// Return the sender of this transaction.
+    pub fn sender(&self) -> AccountAddress {
+        self.sender
+    }
 }
 
-pub struct RawTransactionBytes<'a>(pub &'a [u8]);
-
-impl<'a> CryptoHash for RawTransactionBytes<'a> {
+impl CryptoHash for RawTransaction {
     type Hasher = RawTransactionHasher;
 
     fn hash(&self) -> HashValue {
         let mut state = Self::Hasher::default();
-        state.write(self.0);
+        state.write(
+            SimpleSerializer::<Vec<u8>>::serialize(self)
+                .expect("Failed to serialize RawTransaction")
+                .as_slice(),
+        );
         state.finish()
     }
 }
 
-impl FromProto for RawTransaction {
-    type ProtoType = crate::proto::transaction::RawTransaction;
-
-    fn from_proto(mut txn: Self::ProtoType) -> Result<Self> {
-        Ok(RawTransaction {
-            sender: AccountAddress::try_from(txn.get_sender_account())?,
-            sequence_number: txn.sequence_number,
-            payload: if txn.has_program() {
-                TransactionPayload::Program(Program::from_proto(txn.take_program())?)
-            } else if txn.has_write_set() {
-                TransactionPayload::WriteSet(WriteSet::from_proto(txn.take_write_set())?)
-            } else {
-                bail!("RawTransaction payload missing");
-            },
-            max_gas_amount: txn.max_gas_amount,
-            gas_unit_price: txn.gas_unit_price,
-            expiration_time: Duration::from_secs(txn.expiration_time),
-        })
+impl CanonicalSerialize for RawTransaction {
+    fn serialize(&self, serializer: &mut impl CanonicalSerializer) -> Result<()> {
+        serializer.encode_struct(&self.sender)?;
+        serializer.encode_u64(self.sequence_number)?;
+        serializer.encode_struct(&self.payload)?;
+        serializer.encode_u64(self.max_gas_amount)?;
+        serializer.encode_u64(self.gas_unit_price)?;
+        serializer.encode_u64(self.expiration_time.as_secs())?;
+        Ok(())
     }
 }
 
-impl IntoProto for RawTransaction {
-    type ProtoType = crate::proto::transaction::RawTransaction;
+impl CanonicalDeserialize for RawTransaction {
+    fn deserialize(deserializer: &mut impl CanonicalDeserializer) -> Result<Self> {
+        let sender = deserializer.decode_struct()?;
+        let sequence_number = deserializer.decode_u64()?;
+        let payload = deserializer.decode_struct()?;
+        let max_gas_amount = deserializer.decode_u64()?;
+        let gas_unit_price = deserializer.decode_u64()?;
+        let expiration_time = Duration::from_secs(deserializer.decode_u64()?);
 
-    fn into_proto(self) -> Self::ProtoType {
-        let mut transaction = Self::ProtoType::new();
-        transaction.set_sender_account(self.sender.as_ref().to_vec());
-        transaction.set_sequence_number(self.sequence_number);
-        match self.payload {
-            TransactionPayload::Program(program) => transaction.set_program(program.into_proto()),
-            TransactionPayload::WriteSet(write_set) => {
-                transaction.set_write_set(write_set.into_proto())
-            }
-        }
-        transaction.set_gas_unit_price(self.gas_unit_price);
-        transaction.set_max_gas_amount(self.max_gas_amount);
-        transaction.set_expiration_time(self.expiration_time.as_secs());
-        transaction
+        Ok(RawTransaction {
+            sender,
+            sequence_number,
+            payload,
+            max_gas_amount,
+            gas_unit_price,
+            expiration_time,
+        })
     }
 }
 
@@ -221,9 +274,91 @@ pub enum TransactionPayload {
     /// A regular programmatic transaction that is executed by the VM.
     Program(Program),
     WriteSet(WriteSet),
+    /// A transaction that publishes code.
+    Module(Module),
+    /// A transaction that executes code.
+    Script(Script),
 }
 
-/// SignedTransaction is what a client submits to a validator node
+impl CanonicalSerialize for TransactionPayload {
+    fn serialize(&self, serializer: &mut impl CanonicalSerializer) -> Result<()> {
+        match self {
+            TransactionPayload::Program(program) => {
+                serializer.encode_u32(TransactionPayloadType::Program as u32)?;
+                serializer.encode_struct(program)?;
+            }
+            TransactionPayload::WriteSet(write_set) => {
+                serializer.encode_u32(TransactionPayloadType::WriteSet as u32)?;
+                serializer.encode_struct(write_set)?;
+            }
+            TransactionPayload::Script(script) => {
+                serializer.encode_u32(TransactionPayloadType::Script as u32)?;
+                serializer.encode_struct(script)?;
+            }
+            TransactionPayload::Module(module) => {
+                serializer.encode_u32(TransactionPayloadType::Module as u32)?;
+                serializer.encode_struct(module)?;
+            }
+        };
+        Ok(())
+    }
+}
+
+impl CanonicalDeserialize for TransactionPayload {
+    fn deserialize(deserializer: &mut impl CanonicalDeserializer) -> Result<Self> {
+        let decoded_payload_type = deserializer.decode_u32()?;
+        let payload_type = TransactionPayloadType::from_u32(decoded_payload_type);
+        match payload_type {
+            Some(TransactionPayloadType::Program) => {
+                Ok(TransactionPayload::Program(deserializer.decode_struct()?))
+            }
+            Some(TransactionPayloadType::WriteSet) => {
+                Ok(TransactionPayload::WriteSet(deserializer.decode_struct()?))
+            }
+            Some(TransactionPayloadType::Script) => {
+                Ok(TransactionPayload::Script(deserializer.decode_struct()?))
+            }
+            Some(TransactionPayloadType::Module) => {
+                Ok(TransactionPayload::Module(deserializer.decode_struct()?))
+            }
+            None => Err(format_err!(
+                "ParseError: Unable to decode TransactionPayloadType, found {}",
+                decoded_payload_type
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+enum TransactionPayloadType {
+    Program = 0,
+    WriteSet = 1,
+    Script = 2,
+    Module = 3,
+}
+
+impl TransactionPayloadType {
+    fn from_u32(value: u32) -> Option<TransactionPayloadType> {
+        match value {
+            0 => Some(TransactionPayloadType::Program),
+            1 => Some(TransactionPayloadType::WriteSet),
+            2 => Some(TransactionPayloadType::Script),
+            3 => Some(TransactionPayloadType::Module),
+            _ => None,
+        }
+    }
+}
+
+impl ::std::marker::Copy for TransactionPayloadType {}
+
+/// A transaction that has been signed.
+///
+/// A `SignedTransaction` is a single transaction that can be atomically executed. Clients submit
+/// these to validator nodes, and the validator and executor submits these to the VM.
+///
+/// **IMPORTANT:** The signature of a `SignedTransaction` is not guaranteed to be verified. For a
+/// transaction whose signature is statically guaranteed to be verified, see
+/// [`SignatureCheckedTransaction`].
 #[derive(Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct SignedTransaction {
     /// The raw transaction
@@ -231,17 +366,38 @@ pub struct SignedTransaction {
 
     /// Sender's public key. When checking the signature, we first need to check whether this key
     /// is indeed the pre-image of the pubkey hash stored under sender's account.
-    public_key: PublicKey,
+    public_key: Ed25519PublicKey,
 
     /// Signature of the transaction that correspond to the public key
-    signature: Signature,
+    signature: Ed25519Signature,
 
-    // The original raw bytes from the protobuf are also stored here so that we use
-    // these bytes when generating the canonical serialization of the SignedTransaction struct
-    // rather than re-serializing them again to avoid risk of non-determinism in the process
+    /// The transaction length is used by the VM to limit the size of transactions
+    transaction_length: usize,
+}
 
-    // the raw transaction bytes generated from the wallet
-    raw_txn_bytes: Vec<u8>,
+/// A transaction for which the signature has been verified. Created by
+/// [`SignedTransaction::check_signature`] and [`RawTransaction::sign`].
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct SignatureCheckedTransaction(SignedTransaction);
+
+impl SignatureCheckedTransaction {
+    /// Returns the `SignedTransaction` within.
+    pub fn into_inner(self) -> SignedTransaction {
+        self.0
+    }
+
+    /// Returns the `RawTransaction` within.
+    pub fn into_raw_transaction(self) -> RawTransaction {
+        self.0.into_raw_transaction()
+    }
+}
+
+impl Deref for SignatureCheckedTransaction {
+    type Target = SignedTransaction;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 impl fmt::Debug for SignedTransaction {
@@ -260,26 +416,29 @@ impl fmt::Debug for SignedTransaction {
 }
 
 impl SignedTransaction {
-    pub fn new_for_test(
+    pub fn new(
         raw_txn: RawTransaction,
-        public_key: PublicKey,
-        signature: Signature,
+        public_key: Ed25519PublicKey,
+        signature: Ed25519Signature,
     ) -> SignedTransaction {
+        let transaction_length = SimpleSerializer::<Vec<u8>>::serialize(&raw_txn)
+            .expect("Unable to serialize RawTransaction")
+            .len();
+
         SignedTransaction {
             raw_txn: raw_txn.clone(),
             public_key,
             signature,
-            // In real world raw_txn should be derived from raw_txn_bytes, not the opposite.
-            raw_txn_bytes: raw_txn.into_proto_bytes().expect("Should convert."),
+            transaction_length,
         }
     }
 
-    pub fn public_key(&self) -> PublicKey {
-        self.public_key
+    pub fn public_key(&self) -> Ed25519PublicKey {
+        self.public_key.clone()
     }
 
-    pub fn signature(&self) -> Signature {
-        self.signature
+    pub fn signature(&self) -> Ed25519Signature {
+        self.signature.clone()
     }
 
     pub fn sender(&self) -> AccountAddress {
@@ -311,14 +470,15 @@ impl SignedTransaction {
     }
 
     pub fn raw_txn_bytes_len(&self) -> usize {
-        self.raw_txn_bytes.len()
+        self.transaction_length
     }
 
-    /// Verifies the signature of given transaction. Returns `Ok()` if the signature is valid.
-    pub fn verify_signature(&self) -> Result<()> {
-        let hash = RawTransactionBytes(&self.raw_txn_bytes).hash();
-        signing::verify_message(hash, &self.signature, &self.public_key)?;
-        Ok(())
+    /// Checks that the signature of given transaction. Returns `Ok(SignatureCheckedTransaction)` if
+    /// the signature is valid.
+    pub fn check_signature(self) -> Result<SignatureCheckedTransaction> {
+        self.public_key
+            .verify_signature(&self.raw_txn.hash(), &self.signature)?;
+        Ok(SignatureCheckedTransaction(self))
     }
 
     pub fn format_for_client(&self, get_transaction_name: impl Fn(&[u8]) -> String) -> String {
@@ -348,39 +508,9 @@ impl CryptoHash for SignedTransaction {
 impl FromProto for SignedTransaction {
     type ProtoType = crate::proto::transaction::SignedTransaction;
 
-    fn from_proto(txn: Self::ProtoType) -> Result<Self> {
-        let proto_raw_transaction = protobuf::parse_from_bytes::<
-            crate::proto::transaction::RawTransaction,
-        >(txn.raw_txn_bytes.as_ref())?;
-
-        // First check if extra data is being sent in the proto.  Note that this is a temporary
-        // measure to prevent extraneous data from being packaged.  Longer-term, we will likely
-        // need to allow this for compatibility reasons.  Note that we only need to do this
-        // for raw bytes under the signed transaction.  We do this because we actually store this
-        // field in the DB.
-        // TODO: Remove prevention of unknown fields
-        ensure!(
-            proto_raw_transaction.unknown_fields.fields.is_none(),
-            "Unknown fields not allowed in testnet proto for raw transaction"
-        );
-
-        let t = SignedTransaction {
-            raw_txn: RawTransaction::from_proto(proto_raw_transaction)?,
-            public_key: PublicKey::from_slice(txn.get_sender_public_key())?,
-            signature: Signature::from_compact(txn.get_sender_signature())?,
-            raw_txn_bytes: txn.raw_txn_bytes,
-        };
-
-        // Please do not remove this check. It may appear redundant, as it is also performed by VM,
-        // but its goal is to ensure that:
-        // - transactions parsed from a GRPC request are validated before being processed by other
-        // portions of code;
-        // - Moxie Marlinspike's Cryptographic Doom Principle is mitigated;
-        // - resources are committed only for valid data.
-        match t.verify_signature() {
-            Ok(_) => Ok(t),
-            Err(e) => Err(e),
-        }
+    fn from_proto(mut txn: Self::ProtoType) -> Result<Self> {
+        let signed_txn = SimpleDeserializer::deserialize(&txn.take_signed_txn())?;
+        Ok(signed_txn)
     }
 }
 
@@ -388,15 +518,24 @@ impl IntoProto for SignedTransaction {
     type ProtoType = crate::proto::transaction::SignedTransaction;
 
     fn into_proto(self) -> Self::ProtoType {
+        let signed_txn = SimpleSerializer::<Vec<u8>>::serialize(&self)
+            .expect("Unable to serialize SignedTransaction");
         let mut transaction = Self::ProtoType::new();
-        transaction.set_raw_txn_bytes(self.raw_txn_bytes);
-        transaction.set_sender_public_key(self.public_key.to_slice().to_vec());
-        transaction.set_sender_signature(self.signature.to_compact().to_vec());
+        transaction.set_signed_txn(signed_txn);
         transaction
     }
 }
 
-#[derive(Arbitrary, Clone, Debug, Eq, PartialEq)]
+impl IntoProto for SignatureCheckedTransaction {
+    type ProtoType = crate::proto::transaction::SignedTransaction;
+
+    fn into_proto(self) -> Self::ProtoType {
+        self.0.into_proto()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testing"), derive(Arbitrary))]
 pub struct SignedTransactionWithProof {
     pub version: Version,
     pub signed_transaction: SignedTransaction,
@@ -503,9 +642,9 @@ impl IntoProto for SignedTransactionWithProof {
 impl CanonicalSerialize for SignedTransaction {
     fn serialize(&self, serializer: &mut impl CanonicalSerializer) -> Result<()> {
         serializer
-            .encode_variable_length_bytes(&self.raw_txn_bytes)?
-            .encode_variable_length_bytes(&self.public_key.to_slice())?
-            .encode_variable_length_bytes(&self.signature.to_compact())?;
+            .encode_struct(&self.raw_txn)?
+            .encode_bytes(&self.public_key.to_bytes())?
+            .encode_bytes(&self.signature.to_bytes())?;
         Ok(())
     }
 }
@@ -515,19 +654,15 @@ impl CanonicalDeserialize for SignedTransaction {
     where
         Self: Sized,
     {
-        let raw_txn_bytes = deserializer.decode_variable_length_bytes()?;
-        let public_key_bytes = deserializer.decode_variable_length_bytes()?;
-        let signature_bytes = deserializer.decode_variable_length_bytes()?;
-        let proto_raw_transaction = protobuf::parse_from_bytes::<
-            crate::proto::transaction::RawTransaction,
-        >(raw_txn_bytes.as_ref())?;
+        let raw_txn: RawTransaction = deserializer.decode_struct()?;
+        let public_key_bytes = deserializer.decode_bytes()?;
+        let signature_bytes = deserializer.decode_bytes()?;
 
-        Ok(SignedTransaction {
-            raw_txn: RawTransaction::from_proto(proto_raw_transaction)?,
-            public_key: PublicKey::from_slice(&public_key_bytes)?,
-            signature: Signature::from_compact(&signature_bytes)?,
-            raw_txn_bytes,
-        })
+        Ok(SignedTransaction::new(
+            raw_txn,
+            Ed25519PublicKey::try_from(&public_key_bytes[..])?,
+            Ed25519Signature::try_from(&signature_bytes[..])?,
+        ))
     }
 }
 
@@ -543,26 +678,36 @@ pub enum TransactionStatus {
     Keep(VMStatus),
 }
 
+impl TransactionStatus {
+    pub fn vm_status(&self) -> &VMStatus {
+        match self {
+            TransactionStatus::Discard(vm_status) | TransactionStatus::Keep(vm_status) => vm_status,
+        }
+    }
+}
+
 impl From<VMStatus> for TransactionStatus {
     fn from(vm_status: VMStatus) -> Self {
-        let should_discard = match vm_status {
+        let should_discard = match vm_status.status_type() {
+            // Any unknown error should be discarded
+            StatusType::Unknown => true,
             // Any error that is a validation status (i.e. an error arising from the prologue)
             // causes the transaction to not be included.
-            VMStatus::Validation(_) => true,
+            StatusType::Validation => true,
             // If the VM encountered an invalid internal state, we should discard the transaction.
-            VMStatus::InvariantViolation(_) => true,
+            StatusType::InvariantViolation => true,
             // A transaction that publishes code that cannot be verified is currently not charged.
             // Therefore the transaction can be excluded.
             //
             // The original plan was to charge for verification, but the code didn't implement it
             // properly. The decision of whether to charge or not will be made based on data (if
             // verification checks are too expensive then yes, otherwise no).
-            VMStatus::Verification(_) => true,
+            StatusType::Verification => true,
             // Even if we are unable to decode the transaction, there should be a charge made to
             // that user's account for the gas fees related to decoding, running the prologue etc.
-            VMStatus::Deserialization(_) => false,
+            StatusType::Deserialization => false,
             // Any error encountered during the execution of the transaction will charge gas.
-            VMStatus::Execution(_) => false,
+            StatusType::Execution => false,
         };
 
         if should_discard {
@@ -621,9 +766,28 @@ impl TransactionOutput {
     }
 }
 
+impl FromProto for TransactionInfo {
+    type ProtoType = crate::proto::transaction_info::TransactionInfo;
+    fn from_proto(mut proto_txn_info: Self::ProtoType) -> Result<Self> {
+        let signed_txn_hash = HashValue::from_proto(proto_txn_info.take_signed_transaction_hash())?;
+        let state_root_hash = HashValue::from_proto(proto_txn_info.take_state_root_hash())?;
+        let event_root_hash = HashValue::from_proto(proto_txn_info.take_event_root_hash())?;
+        let gas_used = proto_txn_info.get_gas_used();
+        let major_status = StatusCode::from_proto(proto_txn_info.get_major_status())?;
+        Ok(TransactionInfo::new(
+            signed_txn_hash,
+            state_root_hash,
+            event_root_hash,
+            gas_used,
+            major_status,
+        ))
+    }
+}
+
 /// `TransactionInfo` is the object we store in the transaction accumulator. It consists of the
 /// transaction as well as the execution result of this transaction.
-#[derive(Arbitrary, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, FromProto, IntoProto)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, IntoProto)]
+#[cfg_attr(any(test, feature = "testing"), derive(Arbitrary))]
 #[ProtoType(crate::proto::transaction_info::TransactionInfo)]
 pub struct TransactionInfo {
     /// The hash of this transaction.
@@ -638,6 +802,11 @@ pub struct TransactionInfo {
 
     /// The amount of gas used.
     gas_used: u64,
+
+    /// The major status. This will provide the general error class. Note that this is not
+    /// particularly high fidelity in the presence of sub statuses but, the major status does
+    /// determine whether or not the transaction is applied to the global state or not.
+    major_status: StatusCode,
 }
 
 impl TransactionInfo {
@@ -648,12 +817,14 @@ impl TransactionInfo {
         state_root_hash: HashValue,
         event_root_hash: HashValue,
         gas_used: u64,
+        major_status: StatusCode,
     ) -> TransactionInfo {
         TransactionInfo {
             signed_transaction_hash,
             state_root_hash,
             event_root_hash,
             gas_used,
+            major_status,
         }
     }
 
@@ -678,15 +849,20 @@ impl TransactionInfo {
     pub fn gas_used(&self) -> u64 {
         self.gas_used
     }
+
+    pub fn major_status(&self) -> StatusCode {
+        self.major_status
+    }
 }
 
 impl CanonicalSerialize for TransactionInfo {
     fn serialize(&self, serializer: &mut impl CanonicalSerializer) -> Result<()> {
         serializer
-            .encode_raw_bytes(self.signed_transaction_hash.as_ref())?
-            .encode_raw_bytes(self.state_root_hash.as_ref())?
-            .encode_raw_bytes(self.event_root_hash.as_ref())?
-            .encode_u64(self.gas_used)?;
+            .encode_bytes(self.signed_transaction_hash.as_ref())?
+            .encode_bytes(self.state_root_hash.as_ref())?
+            .encode_bytes(self.event_root_hash.as_ref())?
+            .encode_u64(self.gas_used)?
+            .encode_u64(self.major_status.into())?;
         Ok(())
     }
 }
@@ -709,6 +885,7 @@ pub struct TransactionToCommit {
     account_states: HashMap<AccountAddress, AccountStateBlob>,
     events: Vec<ContractEvent>,
     gas_used: u64,
+    major_status: StatusCode,
 }
 
 impl TransactionToCommit {
@@ -717,12 +894,14 @@ impl TransactionToCommit {
         account_states: HashMap<AccountAddress, AccountStateBlob>,
         events: Vec<ContractEvent>,
         gas_used: u64,
+        major_status: StatusCode,
     ) -> Self {
         TransactionToCommit {
             signed_txn,
             account_states,
             events,
             gas_used,
+            major_status,
         }
     }
 
@@ -740,6 +919,10 @@ impl TransactionToCommit {
 
     pub fn gas_used(&self) -> u64 {
         self.gas_used
+    }
+
+    pub fn major_status(&self) -> StatusCode {
+        self.major_status
     }
 }
 
@@ -769,12 +952,14 @@ impl FromProto for TransactionToCommit {
             .map(ContractEvent::from_proto)
             .collect::<Result<Vec<_>>>()?;
         let gas_used = object.get_gas_used();
+        let major_status = StatusCode::from_proto(object.get_major_status())?;
 
         Ok(TransactionToCommit {
             signed_txn,
             account_states,
             events,
             gas_used,
+            major_status,
         })
     }
 }
@@ -803,6 +988,7 @@ impl IntoProto for TransactionToCommit {
                 .collect::<Vec<_>>(),
         ));
         proto.set_gas_used(self.gas_used);
+        proto.set_major_status(self.major_status.into_proto());
         proto
     }
 }

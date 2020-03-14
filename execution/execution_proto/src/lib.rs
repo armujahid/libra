@@ -1,8 +1,6 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-#![allow(clippy::unit_arg)]
-
 pub mod proto;
 
 #[cfg(test)]
@@ -10,17 +8,19 @@ mod protobuf_conversion_test;
 
 use crypto::HashValue;
 use failure::prelude::*;
+#[cfg(any(test, feature = "testing"))]
 use proptest_derive::Arbitrary;
 use proto_conv::{FromProto, IntoProto};
 use types::{
-    ledger_info::LedgerInfoWithSignatures,
-    transaction::{SignedTransaction, TransactionListWithProof, TransactionStatus},
+    crypto_proxies::LedgerInfoWithSignatures,
+    transaction::{SignedTransaction, TransactionListWithProof, TransactionStatus, Version},
     validator_set::ValidatorSet,
     vm_error::VMStatus,
 };
 
-#[derive(Arbitrary, Clone, Debug, Eq, PartialEq, FromProto, IntoProto)]
+#[derive(Clone, Debug, Eq, PartialEq, FromProto, IntoProto)]
 #[ProtoType(crate::proto::execution::ExecuteBlockRequest)]
+#[cfg_attr(any(test, feature = "testing"), derive(Arbitrary))]
 pub struct ExecuteBlockRequest {
     /// The list of transactions from consensus.
     pub transactions: Vec<SignedTransaction>,
@@ -46,13 +46,17 @@ impl ExecuteBlockRequest {
     }
 }
 
-#[derive(Arbitrary, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testing"), derive(Arbitrary))]
 pub struct ExecuteBlockResponse {
     /// Root hash of the transaction accumulator as if all transactions in this block are applied.
     root_hash: HashValue,
 
     /// Status code for each individual transaction in this block.
     status: Vec<TransactionStatus>,
+
+    /// The corresponding ledger version when this block is committed.
+    version: Version,
 
     /// If set, these are the set of validators that will be used to start the next epoch
     /// immediately after this state is committed.
@@ -63,11 +67,13 @@ impl ExecuteBlockResponse {
     pub fn new(
         root_hash: HashValue,
         status: Vec<TransactionStatus>,
+        version: Version,
         validators: Option<ValidatorSet>,
     ) -> Self {
         ExecuteBlockResponse {
             root_hash,
             status,
+            version,
             validators,
         }
     }
@@ -78,6 +84,10 @@ impl ExecuteBlockResponse {
 
     pub fn status(&self) -> &[TransactionStatus] {
         &self.status
+    }
+
+    pub fn version(&self) -> Version {
+        self.version
     }
 
     pub fn validators(&self) -> &Option<ValidatorSet> {
@@ -99,6 +109,7 @@ impl FromProto for ExecuteBlockResponse {
                     Ok(vm_status.into())
                 })
                 .collect::<Result<Vec<_>>>()?,
+            version: object.get_version(),
             validators: object
                 .validators
                 .take()
@@ -126,6 +137,7 @@ impl IntoProto for ExecuteBlockResponse {
                 })
                 .collect(),
         );
+        out.set_version(self.version);
         if let Some(validators) = self.validators {
             out.set_validators(validators.into_proto());
         }
@@ -133,13 +145,15 @@ impl IntoProto for ExecuteBlockResponse {
     }
 }
 
-#[derive(Arbitrary, Clone, Debug, Eq, PartialEq, FromProto, IntoProto)]
+#[derive(Clone, Debug, Eq, PartialEq, FromProto, IntoProto)]
+#[cfg_attr(any(test, feature = "testing"), derive(Arbitrary))]
 #[ProtoType(crate::proto::execution::CommitBlockRequest)]
 pub struct CommitBlockRequest {
     pub ledger_info_with_sigs: LedgerInfoWithSignatures,
 }
 
-#[derive(Arbitrary, Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testing"), derive(Arbitrary))]
 pub enum CommitBlockResponse {
     Succeeded,
     Failed,
@@ -171,13 +185,15 @@ impl IntoProto for CommitBlockResponse {
     }
 }
 
-#[derive(Arbitrary, Clone, Debug, Eq, PartialEq, FromProto, IntoProto)]
+#[derive(Clone, Debug, Eq, PartialEq, FromProto, IntoProto)]
+#[cfg_attr(any(test, feature = "testing"), derive(Arbitrary))]
 #[ProtoType(crate::proto::execution::ExecuteChunkRequest)]
 pub struct ExecuteChunkRequest {
     pub txn_list_with_proof: TransactionListWithProof,
     pub ledger_info_with_sigs: LedgerInfoWithSignatures,
 }
 
-#[derive(Arbitrary, Clone, Debug, Eq, PartialEq, FromProto, IntoProto)]
+#[derive(Clone, Debug, Eq, PartialEq, FromProto, IntoProto)]
+#[cfg_attr(any(test, feature = "testing"), derive(Arbitrary))]
 #[ProtoType(crate::proto::execution::ExecuteChunkResponse)]
 pub struct ExecuteChunkResponse {}

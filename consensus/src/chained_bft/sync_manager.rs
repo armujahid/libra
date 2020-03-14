@@ -3,27 +3,27 @@
 
 use crate::{
     chained_bft::{
-        block_storage::{BlockReader, BlockStore, InsertError},
+        block_storage::{BlockReader, BlockStore, InsertError, NeedFetchResult},
         common::{Author, Payload},
-        consensus_types::{block::Block, quorum_cert::QuorumCert},
+        consensus_types::{block::Block, quorum_cert::QuorumCert, sync_info::SyncInfo},
         network::ConsensusNetworkImpl,
         persistent_storage::PersistentStorage,
     },
     counters,
     state_replication::StateComputer,
-    state_synchronizer::SyncStatus,
 };
-use failure::{Fail, Result};
+use failure::{self, Fail};
 use logger::prelude::*;
 use network::proto::BlockRetrievalStatus;
 use rand::{prelude::*, Rng};
 use std::{
     clone::Clone,
+    result::Result,
     sync::Arc,
     time::{Duration, Instant},
 };
 use termion::color::*;
-use types::{account_address::AccountAddress, transaction::TransactionListWithProof};
+use types::account_address::AccountAddress;
 
 /// SyncManager is responsible for fetching dependencies and 'catching up' for given qc/ledger info
 pub struct SyncManager<T> {
@@ -33,17 +33,25 @@ pub struct SyncManager<T> {
     state_computer: Arc<dyn StateComputer<Payload = T>>,
 }
 
-/// This struct describes where do we sync to
-pub struct SyncInfo {
-    /// Highest ledger info to invoke state sync for
-    /// This is optional for now, because vote does not have it
+/// Keeps the necessary context for `SyncMgr` to bring the missing information.
+pub struct SyncMgrContext {
     pub highest_ledger_info: QuorumCert,
-    /// Quorum certificate to be inserted into block tree
     pub highest_quorum_cert: QuorumCert,
-    /// Author of messages that triggered this sync.
-    /// For now we sync from this peer. In future we going to use peers from quorum certs,
-    /// and this field going to be mostly informational
-    pub peer: Author,
+    /// Preferred peer: this is typically the peer that delivered the original QC and
+    /// thus has higher chances to be able to return the information than the other
+    /// peers that signed the QC.
+    /// If no preferred peer provided, random peers from the given QC are going to be queried.
+    pub preferred_peer: Author,
+}
+
+impl SyncMgrContext {
+    pub fn new(sync_info: &SyncInfo, preferred_peer: Author) -> Self {
+        Self {
+            highest_ledger_info: sync_info.highest_ledger_info().clone(),
+            highest_quorum_cert: sync_info.highest_quorum_cert().clone(),
+            preferred_peer,
+        }
+    }
 }
 
 impl<T> SyncManager<T>
@@ -60,7 +68,6 @@ where
         // Prometheus if some conditions never happen.  Invoking get() function enforces creation.
         counters::BLOCK_RETRIEVAL_COUNT.get();
         counters::STATE_SYNC_COUNT.get();
-        counters::STATE_SYNC_TXN_REPLAYED.get();
         SyncManager {
             block_store,
             storage,
@@ -72,31 +79,44 @@ where
     /// Fetches dependencies for given sync_info.quorum_cert
     /// If gap is large, performs state sync using process_highest_ledger_info
     /// Inserts sync_info.quorum_cert into block store as the last step
-    pub async fn sync_to(&mut self, deadline: Instant, sync_info: SyncInfo) -> Result<()> {
-        let highest_ledger_info = sync_info.highest_ledger_info.clone();
-
-        self.process_highest_ledger_info(highest_ledger_info, sync_info.peer, deadline)
-            .await?;
-
-        self.fetch_quorum_cert(
-            sync_info.highest_quorum_cert.clone(),
-            sync_info.peer,
+    pub async fn sync_to(
+        &mut self,
+        deadline: Instant,
+        sync_context: SyncMgrContext,
+    ) -> failure::Result<()> {
+        self.process_highest_ledger_info(
+            sync_context.highest_ledger_info.clone(),
+            sync_context.preferred_peer,
             deadline,
         )
         .await?;
+
+        match self
+            .block_store
+            .need_fetch_for_quorum_cert(&sync_context.highest_quorum_cert)
+        {
+            NeedFetchResult::NeedFetch => {
+                self.fetch_quorum_cert(
+                    sync_context.highest_quorum_cert.clone(),
+                    sync_context.preferred_peer,
+                    deadline,
+                )
+                .await?
+            }
+            NeedFetchResult::QCBlockExist => self
+                .block_store
+                .insert_single_quorum_cert(sync_context.highest_quorum_cert)?,
+            _ => (),
+        }
         Ok(())
     }
 
-    /// Get a chunk of transactions as a batch
-    pub async fn get_chunk(
+    pub async fn execute_and_insert_block(
         &self,
-        start_version: u64,
-        target_version: u64,
-        batch_size: u64,
-    ) -> Result<TransactionListWithProof> {
-        self.state_computer
-            .get_chunk(start_version, target_version, batch_size)
-            .await
+        block: Block<T>,
+    ) -> Result<Arc<Block<T>>, InsertError> {
+        // execute_and_insert_block has shortcut to return block if it exists
+        self.block_store.execute_and_insert_block(block).await
     }
 
     /// Insert the quorum certificate separately from the block, used to split the processing of
@@ -108,7 +128,7 @@ where
         qc: QuorumCert,
         preferred_peer: Author,
         deadline: Instant,
-    ) -> std::result::Result<(), InsertError> {
+    ) -> Result<(), InsertError> {
         let mut pending = vec![];
         let network = self.network.clone();
         let mut retriever = BlockRetriever {
@@ -117,10 +137,13 @@ where
             preferred_peer,
         };
         let mut retrieve_qc = qc.clone();
-        while !self
-            .block_store
-            .block_exists(retrieve_qc.certified_block_id())
-        {
+        loop {
+            if self
+                .block_store
+                .block_exists(retrieve_qc.certified_block_id())
+            {
+                break;
+            }
             let mut blocks = retriever.retrieve_block_for_qc(&retrieve_qc, 1).await?;
             // retrieve_block_for_qc guarantees that blocks has exactly 1 element
             let block = blocks.remove(0);
@@ -130,10 +153,10 @@ where
         // insert the qc <- block pair
         while let Some(block) = pending.pop() {
             let block_qc = block.quorum_cert().clone();
-            self.block_store.insert_single_quorum_cert(block_qc).await?;
+            self.block_store.insert_single_quorum_cert(block_qc)?;
             self.block_store.execute_and_insert_block(block).await?;
         }
-        self.block_store.insert_single_quorum_cert(qc).await
+        self.block_store.insert_single_quorum_cert(qc)
     }
 
     /// Check the highest ledger info sent by peer to see if we're behind and start a fast
@@ -149,7 +172,7 @@ where
         highest_ledger_info: QuorumCert,
         peer: Author,
         deadline: Instant,
-    ) -> Result<()> {
+    ) -> failure::Result<()> {
         let committed_block_id = highest_ledger_info
             .committed_block_id()
             .ok_or_else(|| format_err!("highest ledger info has no committed block"))?;
@@ -193,12 +216,11 @@ where
             .sync_to(highest_ledger_info.clone())
             .await
         {
-            Ok(SyncStatus::Finished) => (),
-            Ok(e) => panic!(
-                "state synchronizer failure: {:?}, this validator will be killed as it can not \
+            Ok(true) => (),
+            Ok(false) => panic!(
+                "state synchronizer failure, this validator will be killed as it can not \
                  recover from this error.  After the validator is restarted, synchronization will \
                  be retried.",
-                e
             ),
             Err(e) => panic!(
                 "state synchronizer failure: {:?}, this validator will be killed as it can not \
@@ -207,7 +229,7 @@ where
                 e
             ),
         };
-        counters::STATE_SYNC_DURATION_MS.observe(pre_sync_instance.elapsed().as_millis() as f64);
+        counters::STATE_SYNC_DURATION_S.observe_duration(pre_sync_instance.elapsed());
         let root = (
             blocks.pop().expect("should have 3-chain"),
             quorum_certs.last().expect("should have 3-chain").clone(),
@@ -259,7 +281,7 @@ impl BlockRetriever {
         &'a mut self,
         qc: &'a QuorumCert,
         num_blocks: u64,
-    ) -> std::result::Result<Vec<Block<T>>, BlockRetrieverError>
+    ) -> Result<Vec<Block<T>>, BlockRetrieverError>
     where
         T: Payload,
     {
@@ -298,7 +320,9 @@ impl BlockRetriever {
                 Err(e) => {
                     warn!(
                         "Failed to fetch block {} from {}: {:?}, trying another peer",
-                        block_id, peer, e
+                        block_id,
+                        peer.short_str(),
+                        e
                     );
                     continue;
                 }
@@ -307,7 +331,9 @@ impl BlockRetriever {
             if response.status != BlockRetrievalStatus::SUCCEEDED {
                 warn!(
                     "Failed to fetch block {} from {}: {:?}, trying another peer",
-                    block_id, peer, response.status
+                    block_id,
+                    peer.short_str(),
+                    response.status
                 );
                 continue;
             }
@@ -329,6 +355,7 @@ impl BlockRetriever {
             }
             return self.preferred_peer;
         }
+
         let peer_idx = thread_rng().gen_range(0, peers.len());
         *peers.remove(peer_idx)
     }
@@ -344,10 +371,11 @@ fn retrieval_timeout(deadline: &Instant, attempt: u32) -> Option<Duration> {
     assert!(attempt > 0, "retrieval_timeout attempt can't be 0");
     let exp = RETRIEVAL_MAX_EXP.min(attempt - 1); // [0..RETRIEVAL_MAX_EXP]
     let request_timeout = RETRIEVAL_INITIAL_TIMEOUT * 2_u32.pow(exp);
-    let deadline_timeout = deadline.checked_duration_since(Instant::now());
-    if let Some(deadline_timeout) = deadline_timeout {
-        Some(request_timeout.min(deadline_timeout))
+    let now = Instant::now();
+    let deadline_timeout = if *deadline >= now {
+        Some(deadline.duration_since(now))
     } else {
         None
-    }
+    };
+    deadline_timeout.map(|delay| request_timeout.min(delay))
 }

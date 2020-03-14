@@ -3,20 +3,35 @@
 
 use super::*;
 use crate::{
-    code_cache::module_cache::VMModuleCache, txn_executor::TransactionExecutor, value::Local,
-};
-use std::collections::HashMap;
-use types::{access_path::AccessPath, account_address::AccountAddress, byte_array::ByteArray};
-use vm::{
-    file_format::{
-        AddressPoolIndex, Bytecode, CodeUnit, CompiledModule, CompiledScript, FunctionDefinition,
-        FunctionHandle, FunctionHandleIndex, FunctionSignature, FunctionSignatureIndex,
-        LocalsSignature, LocalsSignatureIndex, ModuleHandle, ModuleHandleIndex, SignatureToken,
-        StringPoolIndex,
+    code_cache::module_cache::{ModuleCache, VMModuleCache},
+    data_cache::RemoteCache,
+    loaded_data::{
+        function::{FunctionRef, FunctionReference},
+        loaded_module::LoadedModule,
     },
+    txn_executor::TransactionExecutor,
+};
+use bytecode_verifier::{VerifiedModule, VerifiedScript};
+use crypto::ed25519::compat;
+use std::collections::HashMap;
+use types::{
+    access_path::AccessPath, account_address::AccountAddress, byte_array::ByteArray,
+    vm_error::StatusCode,
+};
+use vm::{
+    access::ModuleAccess,
+    errors::VMResult,
+    file_format::{
+        AddressPoolIndex, Bytecode, CodeUnit, CompiledModuleMut, CompiledScript, CompiledScriptMut,
+        FunctionDefinition, FunctionHandle, FunctionHandleIndex, FunctionSignature,
+        FunctionSignatureIndex, IdentifierIndex, LocalsSignature, LocalsSignatureIndex,
+        ModuleHandle, ModuleHandleIndex, SignatureToken, UserStringIndex, NO_TYPE_ACTUALS,
+    },
+    gas_schedule::{AbstractMemorySize, GasAlgebra, GasPrice, GasUnits},
     transaction_metadata::TransactionMetadata,
 };
 use vm_cache_map::Arena;
+use vm_runtime_types::value::{Locals, Value};
 
 // Trait for the data cache to build a TransactionProcessor
 struct FakeDataCache {
@@ -33,29 +48,30 @@ impl FakeDataCache {
 }
 
 impl RemoteCache for FakeDataCache {
-    fn get(&self, _access_path: &AccessPath) -> Result<Option<Vec<u8>>, VMInvariantViolation> {
+    fn get(&self, _access_path: &AccessPath) -> VMResult<Option<Vec<u8>>> {
         Ok(None)
     }
 }
 
-fn fake_script() -> CompiledScript {
-    CompiledScript {
+fn fake_script() -> VerifiedScript {
+    let compiled_script = CompiledScriptMut {
         main: FunctionDefinition {
             function: FunctionHandleIndex::new(0),
             flags: CodeUnit::PUBLIC,
+            acquires_global_resources: vec![],
             code: CodeUnit {
                 max_stack_size: 10,
                 locals: LocalsSignatureIndex(0),
-                code: vec![],
+                code: vec![Bytecode::Ret],
             },
         },
         module_handles: vec![ModuleHandle {
             address: AddressPoolIndex::new(0),
-            name: StringPoolIndex::new(0),
+            name: IdentifierIndex::new(0),
         }],
         struct_handles: vec![],
         function_handles: vec![FunctionHandle {
-            name: StringPoolIndex::new(0),
+            name: IdentifierIndex::new(0),
             signature: FunctionSignatureIndex::new(0),
             module: ModuleHandleIndex::new(0),
         }],
@@ -63,21 +79,26 @@ fn fake_script() -> CompiledScript {
         function_signatures: vec![FunctionSignature {
             arg_types: vec![],
             return_types: vec![],
+            type_formals: vec![],
         }],
         locals_signatures: vec![LocalsSignature(vec![])],
-        string_pool: vec!["hello".to_string()],
+        identifiers: idents(vec!["hello"]),
+        user_strings: vec!["hello world".into()],
         byte_array_pool: vec![ByteArray::new(vec![0u8; 32])],
         address_pool: vec![AccountAddress::default()],
     }
+    .freeze()
+    .expect("test script should satisfy bounds checker");
+    VerifiedScript::new(compiled_script).expect("test script should satisfy bytecode verifier")
 }
 
 fn test_simple_instruction_impl<'alloc, 'txn>(
     vm: &mut TransactionExecutor<'alloc, 'txn, VMModuleCache<'alloc>>,
     instr: Bytecode,
-    value_stack_before: Vec<Local>,
-    value_stack_after: Vec<Local>,
-    local_before: Vec<Local>,
-    local_after: Vec<Local>,
+    value_stack_before: Vec<Value>,
+    value_stack_after: Vec<Value>,
+    local_before: Locals,
+    local_after: Locals,
     expected_offset: u16,
 ) -> VMResult<()> {
     let code = vec![instr];
@@ -85,21 +106,29 @@ fn test_simple_instruction_impl<'alloc, 'txn>(
         .top_frame_mut()?
         .set_with_states(0, local_before);
     vm.execution_stack.set_stack(value_stack_before);
-    let offset = try_runtime!(vm.execute_block(code.as_slice(), 0));
-    assert_eq!(vm.execution_stack.get_value_stack(), &value_stack_after);
+    let offset = vm.execute_block(code.as_slice(), 0)?;
+    let stack_before_and_after = vm
+        .execution_stack
+        .get_value_stack()
+        .iter()
+        .zip(value_stack_after);
+    for (v_before, v_after) in stack_before_and_after {
+        assert!(v_before.clone().equals(&v_after).unwrap())
+    }
     let top_frame = vm.execution_stack.top_frame()?;
-    assert_eq!(top_frame.get_locals(), &local_after);
+    let locals = top_frame.get_locals();
+    assert!(locals.equals(&local_after));
     assert_eq!(offset, expected_offset);
-    Ok(Ok(()))
+    Ok(())
 }
 
 fn test_simple_instruction<'alloc, 'txn>(
     vm: &mut TransactionExecutor<'alloc, 'txn, VMModuleCache<'alloc>>,
     instr: Bytecode,
-    value_stack_before: Vec<Local>,
-    value_stack_after: Vec<Local>,
-    local_before: Vec<Local>,
-    local_after: Vec<Local>,
+    value_stack_before: Vec<Value>,
+    value_stack_after: Vec<Value>,
+    local_before: Locals,
+    local_after: Locals,
     expected_offset: u16,
 ) {
     test_simple_instruction_impl(
@@ -111,41 +140,45 @@ fn test_simple_instruction<'alloc, 'txn>(
         local_after,
         expected_offset,
     )
-    .unwrap()
     .unwrap();
 }
 
 fn test_binop_instruction_impl<'alloc, 'txn>(
     vm: &mut TransactionExecutor<'alloc, 'txn, VMModuleCache<'alloc>>,
     instr: Bytecode,
-    stack: Vec<Local>,
-    expected_value: Local,
+    stack: Vec<Value>,
+    expected_value: Value,
 ) -> VMResult<()> {
-    test_simple_instruction_impl(vm, instr, stack, vec![expected_value], vec![], vec![], 1)
+    test_simple_instruction_impl(
+        vm,
+        instr,
+        stack,
+        vec![expected_value],
+        Locals::new(0),
+        Locals::new(0),
+        1,
+    )
 }
 
 fn test_binop_instruction<'alloc, 'txn>(
     vm: &mut TransactionExecutor<'alloc, 'txn, VMModuleCache<'alloc>>,
     instr: Bytecode,
-    stack: Vec<Local>,
-    expected_value: Local,
+    stack: Vec<Value>,
+    expected_value: Value,
 ) {
-    test_binop_instruction_impl(vm, instr, stack, expected_value)
-        .unwrap()
-        .unwrap()
+    test_binop_instruction_impl(vm, instr, stack, expected_value).unwrap()
 }
 
 fn test_binop_instruction_overflow<'alloc, 'txn>(
     vm: &mut TransactionExecutor<'alloc, 'txn, VMModuleCache<'alloc>>,
     instr: Bytecode,
-    stack: Vec<Local>,
+    stack: Vec<Value>,
 ) {
     assert_eq!(
-        test_binop_instruction_impl(vm, instr, stack, Local::u64(0))
-            .unwrap()
+        test_binop_instruction_impl(vm, instr, stack, Value::u64(0))
             .unwrap_err()
-            .err,
-        VMErrorKind::ArithmeticError
+            .major_status,
+        StatusCode::ARITHMETIC_ERROR
     );
 }
 
@@ -154,60 +187,62 @@ fn test_simple_instruction_transition() {
     let allocator = Arena::new();
     let module_cache = VMModuleCache::new(&allocator);
     let main_module = fake_script().into_module();
-    let loaded_main = LoadedModule::new(main_module).unwrap();
-    let entry_func = FunctionRef::new(&loaded_main, CompiledScript::MAIN_INDEX).unwrap();
+    let loaded_main = LoadedModule::new(main_module);
+    let entry_func = FunctionRef::new(&loaded_main, CompiledScript::MAIN_INDEX);
     let data_cache = FakeDataCache::new();
     let mut vm =
         TransactionExecutor::new(module_cache, &data_cache, TransactionMetadata::default());
-    vm.execution_stack.push_frame(entry_func);
+    vm.execution_stack
+        .push_frame(entry_func)
+        .expect("push to empty execution stack should succeed");
 
     test_simple_instruction(
         &mut vm,
         Bytecode::Pop,
-        vec![Local::u64(0)],
+        vec![Value::u64(0)],
         vec![],
-        vec![],
-        vec![],
+        Locals::new(0),
+        Locals::new(0),
         1,
     );
 
     test_simple_instruction(
         &mut vm,
         Bytecode::BrTrue(100),
-        vec![Local::bool(true)],
+        vec![Value::bool(true)],
         vec![],
-        vec![],
-        vec![],
+        Locals::new(0),
+        Locals::new(0),
         100,
     );
 
     test_simple_instruction(
         &mut vm,
         Bytecode::BrTrue(100),
-        vec![Local::bool(false)],
+        vec![Value::bool(false)],
         vec![],
-        vec![],
-        vec![],
+        Locals::new(0),
+        Locals::new(0),
         1,
     );
 
     test_simple_instruction(
         &mut vm,
         Bytecode::BrFalse(100),
-        vec![Local::bool(true)],
+        vec![Value::bool(true)],
         vec![],
-        vec![],
-        vec![],
+        Locals::new(0),
+        Locals::new(0),
         1,
     );
 
     test_simple_instruction(
         &mut vm,
         Bytecode::BrFalse(100),
-        vec![Local::bool(false)],
+        vec![Value::bool(false)],
         vec![],
-        vec![],
-        vec![],
+        Locals::new(0),
+        Locals::new(0),
         100,
     );
 
@@ -216,8 +251,8 @@ fn test_simple_instruction_transition() {
         Bytecode::Branch(100),
         vec![],
         vec![],
-        vec![],
-        vec![],
+        Locals::new(0),
+        Locals::new(0),
         100,
     );
 
@@ -225,9 +260,9 @@ fn test_simple_instruction_transition() {
         &mut vm,
         Bytecode::LdConst(100),
         vec![],
-        vec![Local::u64(100)],
-        vec![],
-        vec![],
+        vec![Value::u64(100)],
+        Locals::new(0),
+        Locals::new(0),
         1,
     );
 
@@ -236,19 +271,19 @@ fn test_simple_instruction_transition() {
         &mut vm,
         Bytecode::LdAddr(AddressPoolIndex::new(0)),
         vec![],
-        vec![Local::address(addr)],
-        vec![],
-        vec![],
+        vec![Value::address(addr)],
+        Locals::new(0),
+        Locals::new(0),
         1,
     );
 
     test_simple_instruction(
         &mut vm,
-        Bytecode::LdStr(StringPoolIndex::new(0)),
+        Bytecode::LdStr(UserStringIndex::new(0)),
         vec![],
-        vec![Local::string("hello".to_string())],
-        vec![],
-        vec![],
+        vec![Value::string("hello world".into())],
+        Locals::new(0),
+        Locals::new(0),
         1,
     );
 
@@ -256,9 +291,9 @@ fn test_simple_instruction_transition() {
         &mut vm,
         Bytecode::LdTrue,
         vec![],
-        vec![Local::bool(true)],
-        vec![],
-        vec![],
+        vec![Value::bool(true)],
+        Locals::new(0),
+        Locals::new(0),
         1,
     );
 
@@ -266,77 +301,84 @@ fn test_simple_instruction_transition() {
         &mut vm,
         Bytecode::LdFalse,
         vec![],
-        vec![Local::bool(false)],
-        vec![],
-        vec![],
+        vec![Value::bool(false)],
+        Locals::new(0),
+        Locals::new(0),
         1,
     );
 
+    let mut locals_before = Locals::new(2);
+    locals_before
+        .store_loc(1, Value::u64(10))
+        .expect("local must exist");
     test_simple_instruction(
         &mut vm,
         Bytecode::CopyLoc(1),
         vec![],
-        vec![Local::u64(10)],
-        vec![Local::Invalid, Local::u64(10)],
-        vec![Local::Invalid, Local::u64(10)],
+        vec![Value::u64(10)],
+        locals_before.clone(),
+        locals_before,
         1,
     );
 
+    let mut locals_before = Locals::new(2);
+    locals_before
+        .store_loc(1, Value::u64(10))
+        .expect("local must exist");
+    let locals_after = Locals::new(2);
     test_simple_instruction(
         &mut vm,
         Bytecode::MoveLoc(1),
         vec![],
-        vec![Local::u64(10)],
-        vec![Local::Invalid, Local::u64(10)],
-        vec![Local::Invalid, Local::Invalid],
+        vec![Value::u64(10)],
+        locals_before,
+        locals_after,
         1,
     );
 
+    let locals_before = Locals::new(1);
+    let mut locals_after = Locals::new(1);
+    locals_after
+        .store_loc(0, Value::bool(true))
+        .expect("local must exist");
     test_simple_instruction(
         &mut vm,
         Bytecode::StLoc(0),
-        vec![Local::bool(true)],
+        vec![Value::bool(true)],
         vec![],
-        vec![Local::Invalid],
-        vec![Local::bool(true)],
+        locals_before,
+        locals_after,
         1,
     );
 
+    let locals_before = Locals::new(2);
+    let mut locals_after = Locals::new(2);
+    locals_after
+        .store_loc(1, Value::u64(10))
+        .expect("local must exist");
     test_simple_instruction(
         &mut vm,
         Bytecode::StLoc(1),
-        vec![Local::u64(10)],
+        vec![Value::u64(10)],
         vec![],
-        vec![Local::Invalid, Local::Invalid],
-        vec![Local::Invalid, Local::u64(10)],
+        locals_before,
+        locals_after,
         1,
     );
 
-    test_simple_instruction(
+    let err = test_simple_instruction_impl(
         &mut vm,
-        Bytecode::Assert,
-        vec![Local::u64(42), Local::bool(true)],
+        Bytecode::Abort,
+        vec![Value::u64(777)],
         vec![],
-        vec![],
-        vec![],
+        Locals::new(0),
+        Locals::new(0),
         1,
-    );
+    )
+    .unwrap_err();
 
-    assert_eq!(
-        test_simple_instruction_impl(
-            &mut vm,
-            Bytecode::Assert,
-            vec![Local::u64(777), Local::bool(false)],
-            vec![],
-            vec![],
-            vec![],
-            1
-        )
-        .unwrap()
-        .unwrap_err()
-        .err,
-        VMErrorKind::AssertionFailure(777)
-    );
+    assert_eq!(err.major_status, StatusCode::ABORTED);
+    assert_eq!(err.sub_status, Some(777));
 }
 
 #[test]
@@ -344,210 +386,213 @@ fn test_arith_instructions() {
     let allocator = Arena::new();
     let module_cache = VMModuleCache::new(&allocator);
     let main_module = fake_script().into_module();
-    let loaded_main = LoadedModule::new(main_module).unwrap();
-    let entry_func = FunctionRef::new(&loaded_main, CompiledScript::MAIN_INDEX).unwrap();
+    let loaded_main = LoadedModule::new(main_module);
+    let entry_func = FunctionRef::new(&loaded_main, CompiledScript::MAIN_INDEX);
     let data_cache = FakeDataCache::new();
 
     let mut vm =
         TransactionExecutor::new(module_cache, &data_cache, TransactionMetadata::default());
 
-    vm.execution_stack.push_frame(entry_func);
+    vm.execution_stack
+        .push_frame(entry_func)
+        .expect("push to empty execution stack should succeed");
 
     test_binop_instruction(
         &mut vm,
         Bytecode::Add,
-        vec![Local::u64(1), Local::u64(2)],
-        Local::u64(3),
+        vec![Value::u64(1), Value::u64(2)],
+        Value::u64(3),
     );
     test_binop_instruction_overflow(
         &mut vm,
         Bytecode::Add,
-        vec![Local::u64(u64::max_value()), Local::u64(1)],
+        vec![Value::u64(u64::max_value()), Value::u64(1)],
     );
 
     test_binop_instruction(
         &mut vm,
         Bytecode::Sub,
-        vec![Local::u64(10), Local::u64(2)],
-        Local::u64(8),
+        vec![Value::u64(10), Value::u64(2)],
+        Value::u64(8),
     );
-    test_binop_instruction_overflow(&mut vm, Bytecode::Sub, vec![Local::u64(0), Local::u64(1)]);
+    test_binop_instruction_overflow(&mut vm, Bytecode::Sub, vec![Value::u64(0), Value::u64(1)]);
 
     test_binop_instruction(
         &mut vm,
         Bytecode::Mul,
-        vec![Local::u64(2), Local::u64(3)],
-        Local::u64(6),
+        vec![Value::u64(2), Value::u64(3)],
+        Value::u64(6),
     );
     test_binop_instruction_overflow(
         &mut vm,
         Bytecode::Mul,
-        vec![Local::u64(u64::max_value() / 2), Local::u64(3)],
+        vec![Value::u64(u64::max_value() / 2), Value::u64(3)],
     );
 
     test_binop_instruction(
         &mut vm,
         Bytecode::Mod,
-        vec![Local::u64(10), Local::u64(4)],
-        Local::u64(2),
+        vec![Value::u64(10), Value::u64(4)],
+        Value::u64(2),
     );
-    test_binop_instruction_overflow(&mut vm, Bytecode::Mod, vec![Local::u64(1), Local::u64(0)]);
+    test_binop_instruction_overflow(&mut vm, Bytecode::Mod, vec![Value::u64(1), Value::u64(0)]);
 
     test_binop_instruction(
         &mut vm,
         Bytecode::Div,
-        vec![Local::u64(6), Local::u64(2)],
-        Local::u64(3),
+        vec![Value::u64(6), Value::u64(2)],
+        Value::u64(3),
     );
-    test_binop_instruction_overflow(&mut vm, Bytecode::Div, vec![Local::u64(1), Local::u64(0)]);
+    test_binop_instruction_overflow(&mut vm, Bytecode::Div, vec![Value::u64(1), Value::u64(0)]);
 
     test_binop_instruction(
         &mut vm,
         Bytecode::BitOr,
-        vec![Local::u64(5), Local::u64(6)],
-        Local::u64(7),
+        vec![Value::u64(5), Value::u64(6)],
+        Value::u64(7),
     );
 
     test_binop_instruction(
         &mut vm,
         Bytecode::BitAnd,
-        vec![Local::u64(5), Local::u64(6)],
-        Local::u64(4),
+        vec![Value::u64(5), Value::u64(6)],
+        Value::u64(4),
     );
 
     test_binop_instruction(
         &mut vm,
         Bytecode::Xor,
-        vec![Local::u64(5), Local::u64(6)],
-        Local::u64(3),
+        vec![Value::u64(5), Value::u64(6)],
+        Value::u64(3),
     );
 
     test_binop_instruction(
         &mut vm,
         Bytecode::Or,
-        vec![Local::bool(false), Local::bool(true)],
-        Local::bool(true),
+        vec![Value::bool(false), Value::bool(true)],
+        Value::bool(true),
     );
 
     test_binop_instruction(
         &mut vm,
         Bytecode::Or,
-        vec![Local::bool(false), Local::bool(false)],
-        Local::bool(false),
+        vec![Value::bool(false), Value::bool(false)],
+        Value::bool(false),
     );
 
     test_binop_instruction(
         &mut vm,
         Bytecode::And,
-        vec![Local::bool(false), Local::bool(true)],
-        Local::bool(false),
+        vec![Value::bool(false), Value::bool(true)],
+        Value::bool(false),
     );
 
     test_binop_instruction(
         &mut vm,
         Bytecode::And,
-        vec![Local::bool(true), Local::bool(true)],
-        Local::bool(true),
+        vec![Value::bool(true), Value::bool(true)],
+        Value::bool(true),
     );
 
     test_binop_instruction(
         &mut vm,
         Bytecode::Eq,
-        vec![Local::bool(false), Local::bool(true)],
-        Local::bool(false),
+        vec![Value::bool(false), Value::bool(true)],
+        Value::bool(false),
     );
 
     test_binop_instruction(
         &mut vm,
         Bytecode::Eq,
-        vec![Local::u64(5), Local::u64(6)],
-        Local::bool(false),
+        vec![Value::u64(5), Value::u64(6)],
+        Value::bool(false),
     );
 
     test_binop_instruction(
         &mut vm,
         Bytecode::Neq,
-        vec![Local::bool(false), Local::bool(true)],
-        Local::bool(true),
+        vec![Value::bool(false), Value::bool(true)],
+        Value::bool(true),
     );
 
     test_binop_instruction(
         &mut vm,
         Bytecode::Neq,
-        vec![Local::u64(5), Local::u64(6)],
-        Local::bool(true),
+        vec![Value::u64(5), Value::u64(6)],
+        Value::bool(true),
     );
 
     test_binop_instruction(
         &mut vm,
         Bytecode::Lt,
-        vec![Local::u64(5), Local::u64(6)],
-        Local::bool(true),
+        vec![Value::u64(5), Value::u64(6)],
+        Value::bool(true),
     );
 
     test_binop_instruction(
         &mut vm,
         Bytecode::Lt,
-        vec![Local::u64(5), Local::u64(5)],
-        Local::bool(false),
+        vec![Value::u64(5), Value::u64(5)],
+        Value::bool(false),
     );
 
     test_binop_instruction(
         &mut vm,
         Bytecode::Gt,
-        vec![Local::u64(7), Local::u64(6)],
-        Local::bool(true),
+        vec![Value::u64(7), Value::u64(6)],
+        Value::bool(true),
     );
 
     test_binop_instruction(
         &mut vm,
         Bytecode::Gt,
-        vec![Local::u64(5), Local::u64(5)],
-        Local::bool(false),
+        vec![Value::u64(5), Value::u64(5)],
+        Value::bool(false),
     );
 
     test_binop_instruction(
         &mut vm,
         Bytecode::Le,
-        vec![Local::u64(5), Local::u64(6)],
-        Local::bool(true),
+        vec![Value::u64(5), Value::u64(6)],
+        Value::bool(true),
     );
 
     test_binop_instruction(
         &mut vm,
         Bytecode::Le,
-        vec![Local::u64(5), Local::u64(5)],
-        Local::bool(true),
+        vec![Value::u64(5), Value::u64(5)],
+        Value::bool(true),
     );
 
     test_binop_instruction(
         &mut vm,
         Bytecode::Ge,
-        vec![Local::u64(7), Local::u64(6)],
-        Local::bool(true),
+        vec![Value::u64(7), Value::u64(6)],
+        Value::bool(true),
     );
 
     test_binop_instruction(
         &mut vm,
         Bytecode::Ge,
-        vec![Local::u64(5), Local::u64(5)],
-        Local::bool(true),
+        vec![Value::u64(5), Value::u64(5)],
+        Value::bool(true),
     );
 }
 
-fn fake_module_with_calls(sigs: Vec<(Vec<SignatureToken>, FunctionSignature)>) -> CompiledModule {
-    let mut names: Vec<String> = sigs
+fn fake_module_with_calls(sigs: Vec<(Vec<SignatureToken>, FunctionSignature)>) -> VerifiedModule {
+    let mut names: Vec<Identifier> = sigs
         .iter()
         .enumerate()
-        .map(|(i, _)| format!("func{}", i))
+        .map(|(i, _)| ident(format!("func{}", i)))
         .collect();
-    names.insert(0, "module".to_string());
+    names.insert(0, ident("module"));
     let function_defs = sigs
         .iter()
         .enumerate()
         .map(|(i, _)| FunctionDefinition {
             function: FunctionHandleIndex::new(i as u16),
             flags: CodeUnit::PUBLIC,
+            acquires_global_resources: vec![],
             code: CodeUnit {
                 max_stack_size: 10,
                 locals: LocalsSignatureIndex(i as u16),
@@ -559,34 +604,43 @@ fn fake_module_with_calls(sigs: Vec<(Vec<SignatureToken>, FunctionSignature)>) -
         .iter()
         .enumerate()
         .map(|(i, _)| FunctionHandle {
-            name: StringPoolIndex::new((i + 1) as u16),
+            name: IdentifierIndex::new((i + 1) as u16),
             signature: FunctionSignatureIndex::new(i as u16),
             module: ModuleHandleIndex::new(0),
         })
         .collect();
     let (local_sigs, function_sigs): (Vec<_>, Vec<_>) = sigs.into_iter().unzip();
-    CompiledModule {
+    let compiled_module = CompiledModuleMut {
         function_defs,
         field_defs: vec![],
         struct_defs: vec![],
 
         module_handles: vec![ModuleHandle {
             address: AddressPoolIndex::new(0),
-            name: StringPoolIndex::new(0),
+            name: IdentifierIndex::new(0),
         }],
         struct_handles: vec![],
         function_handles,
         type_signatures: vec![],
         function_signatures: function_sigs,
         locals_signatures: local_sigs.into_iter().map(LocalsSignature).collect(),
-        string_pool: names,
+        identifiers: names,
+        user_strings: vec![],
         byte_array_pool: vec![],
         address_pool: vec![AccountAddress::default()],
     }
+    .freeze()
+    .expect("test module should satisfy the bounds checker");
+
+    // XXX The modules generated here don't satisfy the bytecode verifier at the moment. This should
+    // probably be addressed, but it doesn't affect the validity of the test for now.
+    VerifiedModule::bypass_verifier_DANGEROUS_FOR_TESTING_ONLY(compiled_module)
 }
 
 #[test]
 fn test_call() {
+    // Note that to pass verification, none of the signatures need to have duplicates.
+    // XXX fake_module_with_calls should probably be updated to dedup signatures.
     let module = fake_module_with_calls(vec![
         // () -> (), no local
         (
@@ -594,6 +648,7 @@ fn test_call() {
             FunctionSignature {
                 arg_types: vec![],
                 return_types: vec![],
+                type_formals: vec![],
             },
         ),
         // () -> (), two locals
@@ -602,6 +657,7 @@ fn test_call() {
             FunctionSignature {
                 arg_types: vec![],
                 return_types: vec![],
+                type_formals: vec![],
             },
         ),
         // (Int, Int) -> (), two locals,
@@ -610,6 +666,7 @@ fn test_call() {
             FunctionSignature {
                 arg_types: vec![SignatureToken::U64, SignatureToken::U64],
                 return_types: vec![],
+                type_formals: vec![],
             },
         ),
         // (Int, Int) -> (), three locals,
@@ -622,11 +679,12 @@ fn test_call() {
             FunctionSignature {
                 arg_types: vec![SignatureToken::U64, SignatureToken::U64],
                 return_types: vec![],
+                type_formals: vec![],
             },
         ),
     ]);
 
-    let mod_id = module.self_code_key();
+    let mod_id = module.self_id();
     let allocator = Arena::new();
     let module_cache = VMModuleCache::new_from_module(module, &allocator).unwrap();
     let fake_func = {
@@ -639,42 +697,58 @@ fn test_call() {
     let data_cache = FakeDataCache::new();
     let mut vm =
         TransactionExecutor::new(module_cache, &data_cache, TransactionMetadata::default());
-    vm.execution_stack.push_frame(fake_func);
+    vm.execution_stack
+        .push_frame(fake_func)
+        .expect("push to empty execution stack should succeed");
 
     test_simple_instruction(
         &mut vm,
-        Bytecode::Call(FunctionHandleIndex::new(0)),
+        Bytecode::Call(FunctionHandleIndex::new(0), NO_TYPE_ACTUALS),
         vec![],
         vec![],
-        vec![],
-        vec![],
+        Locals::new(0),
+        Locals::new(0),
         0,
     );
     test_simple_instruction(
         &mut vm,
-        Bytecode::Call(FunctionHandleIndex::new(1)),
+        Bytecode::Call(FunctionHandleIndex::new(1), NO_TYPE_ACTUALS),
         vec![],
         vec![],
-        vec![],
-        vec![Local::Invalid, Local::Invalid],
+        Locals::new(0),
+        Locals::new(2),
         0,
     );
+    let mut locals_after = Locals::new(2);
+    locals_after
+        .store_loc(0, Value::u64(5))
+        .expect("local must exist");
+    locals_after
+        .store_loc(1, Value::u64(4))
+        .expect("local must exist");
     test_simple_instruction(
         &mut vm,
-        Bytecode::Call(FunctionHandleIndex::new(2)),
-        vec![Local::u64(5), Local::u64(4)],
+        Bytecode::Call(FunctionHandleIndex::new(2), NO_TYPE_ACTUALS),
+        vec![Value::u64(5), Value::u64(4)],
         vec![],
-        vec![],
-        vec![Local::u64(5), Local::u64(4)],
+        Locals::new(0),
+        locals_after,
         0,
     );
+    let mut locals_after = Locals::new(3);
+    locals_after
+        .store_loc(0, Value::u64(5))
+        .expect("local must exist");
+    locals_after
+        .store_loc(1, Value::u64(4))
+        .expect("local must exist");
     test_simple_instruction(
         &mut vm,
-        Bytecode::Call(FunctionHandleIndex::new(3)),
-        vec![Local::u64(5), Local::u64(4)],
+        Bytecode::Call(FunctionHandleIndex::new(3), NO_TYPE_ACTUALS),
+        vec![Value::u64(5), Value::u64(4)],
         vec![],
-        vec![],
-        vec![Local::u64(5), Local::u64(4), Local::Invalid],
+        Locals::new(0),
+        locals_after,
         0,
     );
 }
@@ -684,32 +758,34 @@ fn test_transaction_info() {
     let allocator = Arena::new();
     let module_cache = VMModuleCache::new(&allocator);
     let main_module = fake_script().into_module();
-    let loaded_main = LoadedModule::new(main_module).unwrap();
-    let entry_func = FunctionRef::new(&loaded_main, CompiledScript::MAIN_INDEX).unwrap();
+    let loaded_main = LoadedModule::new(main_module);
+    let entry_func = FunctionRef::new(&loaded_main, CompiledScript::MAIN_INDEX);
 
     let txn_info = {
-        let (_, public_key) = crypto::signing::generate_genesis_keypair();
+        let (_, public_key) = compat::generate_genesis_keypair();
         TransactionMetadata {
             sender: AccountAddress::default(),
             public_key,
             sequence_number: 10,
-            max_gas_amount: 100_000_009,
-            gas_unit_price: 5,
-            transaction_size: 100,
+            max_gas_amount: GasUnits::new(100_000_009),
+            gas_unit_price: GasPrice::new(5),
+            transaction_size: AbstractMemorySize::new(100),
         }
     };
     let data_cache = FakeDataCache::new();
     let mut vm = TransactionExecutor::new(module_cache, &data_cache, txn_info);
 
-    vm.execution_stack.push_frame(entry_func);
+    vm.execution_stack
+        .push_frame(entry_func)
+        .expect("push to empty execution stack should succeed");
 
     test_simple_instruction(
         &mut vm,
         Bytecode::GetTxnMaxGasUnits,
         vec![],
-        vec![Local::u64(100_000_009)],
-        vec![],
-        vec![],
+        vec![Value::u64(100_000_009)],
+        Locals::new(0),
+        Locals::new(0),
         1,
     );
 
@@ -717,9 +793,9 @@ fn test_transaction_info() {
         &mut vm,
         Bytecode::GetTxnSequenceNumber,
         vec![],
-        vec![Local::u64(10)],
-        vec![],
-        vec![],
+        vec![Value::u64(10)],
+        Locals::new(0),
+        Locals::new(0),
         1,
     );
 
@@ -727,9 +803,9 @@ fn test_transaction_info() {
         &mut vm,
         Bytecode::GetTxnGasUnitPrice,
         vec![],
-        vec![Local::u64(5)],
-        vec![],
-        vec![],
+        vec![Value::u64(5)],
+        Locals::new(0),
+        Locals::new(0),
         1,
     );
 }
